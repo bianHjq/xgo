@@ -39,10 +39,15 @@ func (w SlogWriter) Write(p []byte) (n int, err error) {
 type responseBodyWriter struct {
 	gin.ResponseWriter
 	body *bytes.Buffer
+	size int
 }
 
-func (r responseBodyWriter) Write(b []byte) (int, error) {
-	r.body.Write(b)
+func (r *responseBodyWriter) Write(b []byte) (int, error) {
+	r.size += len(b)
+	// 仅缓存可日志输出的文本响应，避免 PDF 等二进制内容占内存并污染日志
+	if isLoggableResponseContentType(r.Header().Get("Content-Type")) {
+		r.body.Write(b)
+	}
 	return r.ResponseWriter.Write(b)
 }
 
@@ -187,21 +192,18 @@ func NewGin(opts ...AppOption) *gin.Engine {
 			args = append(args, slog.String("body", bodyStr))
 		}
 
-		// 获取响应的 Content-Type
-		// responseContentType := w.ResponseWriter.Header().Get("Content-Type")
-		// 检查响应是否被编码
-		// contentEncoding := w.ResponseWriter.Header().Get("Content-Encoding")
-		// 添加响应体（如果是JSON且未被编码）
-		// if strings.HasPrefix(responseContentType, "application/json") && w.body.Len() > 0 && contentEncoding == "" {
-		// const maxRespLength = 1024 * 10 // 10KB
-		// respStr := w.body.String()
-		// if len(respStr) > maxRespLength {
-		// 	respStr = respStr[:maxRespLength] + "..."
-		// }
-		if w != nil && w.body != nil {
-			args = append(args, slog.String("response", w.body.String()))
+		if w != nil {
+			responseContentType := w.Header().Get("Content-Type")
+			if isLoggableResponseContentType(responseContentType) && w.body != nil && w.body.Len() > 0 {
+				args = append(args, slog.String("response", w.body.String()))
+			} else if w.size > 0 {
+				// PDF / 图片等二进制响应只记录类型和大小，不打印内容
+				args = append(args,
+					slog.String("response_content_type", responseContentType),
+					slog.Int("response_size", w.size),
+				)
+			}
 		}
-		// }
 
 		if appOptions.PrintReqeustLog {
 			logFunc(c, "http request", args...)
@@ -447,4 +449,29 @@ func isStaticFileRequest(path string) bool {
 		}
 	}
 	return false
+}
+
+// isLoggableResponseContentType 判断响应体是否适合写入访问日志。
+// application/pdf、图片、octet-stream 等文件/二进制内容不应打印。
+func isLoggableResponseContentType(contentType string) bool {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if i := strings.Index(ct, ";"); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	if ct == "" {
+		return true
+	}
+	if strings.HasPrefix(ct, "text/") {
+		return true
+	}
+	switch ct {
+	case "application/json",
+		"application/problem+json",
+		"application/ld+json",
+		"application/xml",
+		"application/javascript",
+		"application/x-www-form-urlencoded":
+		return true
+	}
+	return strings.HasSuffix(ct, "+json") || strings.HasSuffix(ct, "+xml")
 }
